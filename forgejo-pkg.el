@@ -1,0 +1,2 @@
+;; Generated package description from forgejo.el  -*- mode: lisp-data; no-byte-compile: t; lexical-binding:t -*-
+(define-package "forgejo" "0.1.2.0.20260428.172553" "Emacs Forgejo Front-end" '((emacs "29.1") (markdown-mode "2.6") (keymap-popup "0.2.1")) :commit "1feef310af7d076bedf1f3d030a4c5ec87ea84da" :authors '(("Thanos Apollo" . "public@thanosapollo.org")) :maintainer '("Thanos Apollo" . "public@thanosapollo.org") :keywords '("tools" "vc" "git" "forgejo") :url "https://codeberg.org/thanosapollo/emacs-forgejo")

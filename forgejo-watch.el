@@ -1,0 +1,346 @@
+;;; forgejo-watch.el --- Watch rules and polling for Forgejo  -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026  Free Software Foundation, Inc.
+
+;; Author: Thanos Apollo <public@thanosapollo.org>
+;; Keywords: extensions
+
+;; This program is free software; you can redistribute it and/or modify
+;; it under the terms of the GNU General Public License as published by
+;; the Free Software Foundation, either version 3 of the License, or
+;; (at your option) any later version.
+
+;; This program is distributed in the hope that it will be useful,
+;; but WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+;; GNU General Public License for more details.
+
+;; You should have received a copy of the GNU General Public License
+;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+;;; Commentary:
+
+;; Per-repo watch rules with timer-based polling for Forgejo.
+;;
+;; Users define filter rules via `forgejo-watch-rules'.  On each poll
+;; interval, the system fetches matching issues/PRs from the API with
+;; incremental sync (since=), saves to the local DB, and fires hooks
+;; for new items.
+;;
+;; Enable `forgejo-watch-mode' to start polling.
+;; Use `forgejo-watch-list' to browse watched items.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'url-parse)
+(require 'keymap-popup)
+(require 'forgejo)
+(require 'forgejo-api)
+(require 'forgejo-tl)
+(require 'forgejo-db)
+(require 'forgejo-filter)
+(require 'forgejo-utils)
+(require 'forgejo-buffer)
+
+(declare-function forgejo-issue-view "forgejo-issue.el"
+                  (owner repo number))
+(declare-function forgejo-pull-view "forgejo-pull.el"
+                  (owner repo number))
+
+(defvar forgejo-repo--host)
+(defvar forgejo-default-sort)
+(declare-function forgejo-view--list-format "forgejo-view.el" (columns))
+(declare-function forgejo-api-default-limit "forgejo-api.el" ())
+
+;;; Customization
+
+(defcustom forgejo-watch-poll-interval 300
+  "Seconds between watch rule polls."
+  :type 'integer
+  :group 'forgejo)
+
+(defcustom forgejo-watch-rules nil
+  "Per-repo watch rules.
+Each element is a string \"owner/repo\", a cons (\"owner/repo\" . \"filter\"),
+or a single-element list (\"owner/repo\").  The filter query uses the same
+syntax as the interactive filter prompt.  Use \"*\" to match all cached repos.
+Example: ((\"guix/guix\" . \"state:open author:thanosapollo\")
+          (\"thanosapollo/forgejo.el\")
+          (\"*\" . \"author:thanosapollo\"))"
+  :type '(repeat (choice string
+                         (cons string string)
+                         (list string)))
+  :group 'forgejo)
+
+(defcustom forgejo-watch-hooks nil
+  "Hook run when new watch items arrive.
+Each function receives one argument: the list of new issue/PR alists."
+  :type 'hook
+  :group 'forgejo)
+
+(defcustom forgejo-watch-filter-default "read:no"
+  "Default filter for `forgejo-watch-list'.
+Uses the same syntax as the interactive filter prompt.
+Supported prefixes: state:, read:, type:, author:, label:, search:."
+  :type 'string
+  :group 'forgejo)
+
+;;; State
+
+(defvar forgejo-watch--timer nil
+  "Timer for periodic watch polling.")
+
+;;; Rule resolution
+
+(defun forgejo-watch-resolve-rules (host)
+  "Expand `forgejo-watch-rules' into concrete rules for HOST.
+A \"*\" repo-key expands into one rule per cached repo in the DB,
+each inheriting the original filter query."
+  (let (result)
+    (dolist (rule forgejo-watch-rules)
+      (let* ((repo-key (if (stringp rule) rule (car rule)))
+             (query (if (stringp rule) nil (cdr rule))))
+        (if (string= repo-key "*")
+            (dolist (repo-path (forgejo-db-get-cached-repos host))
+              (push (if query (cons repo-path query) repo-path) result))
+          (push rule result))))
+    (nreverse result)))
+
+;;; Polling
+
+(defun forgejo-watch--poll ()
+  "Poll watch rules for new items on all configured hosts."
+  (dolist (entry forgejo-hosts)
+    (let* ((host-url (car entry))
+           (host (url-host (url-generic-parse-url host-url))))
+      (forgejo-watch--poll-rules host-url host))))
+
+;;; Watch rules
+
+(defun forgejo-watch--poll-rules (host-url host)
+  "Poll each watch rule in `forgejo-watch-rules' for HOST-URL/HOST."
+  (dolist (rule (forgejo-watch-resolve-rules host))
+    (forgejo-watch--poll-rule host-url host rule)))
+
+(defun forgejo-watch--poll-rule (host-url host rule)
+  "Poll a single watch RULE for HOST-URL/HOST.
+RULE is \"owner/repo\" or (\"owner/repo\" . \"filter-query\")."
+  (let* ((repo-key (if (stringp rule) rule (car rule)))
+         (query (if (stringp rule) nil (cdr rule)))
+         (parts (split-string repo-key "/"))
+         (owner (nth 0 parts))
+         (repo (nth 1 parts))
+         (filters (forgejo-filter-parse query))
+         (since (forgejo-db-get-sync-time host owner repo "watch"))
+         (api-filters (if since
+                          (plist-put (copy-sequence filters) :since since)
+			filters))
+         (endpoint (format "repos/%s/%s/issues" owner repo))
+         (params (forgejo-filter-build-params nil api-filters
+                                              forgejo-default-sort
+                                              (forgejo-api-default-limit))))
+    (forgejo-api-get-paged
+     host-url endpoint params
+     (lambda (page-data _headers _page-num)
+       (when page-data
+         (forgejo-db-save-issues host owner repo page-data)))
+     (lambda (all-data _headers)
+       (when all-data
+         (forgejo-db-set-sync-time
+          host owner repo "watch"
+          (format-time-string "%Y-%m-%dT%H:%M:%SZ" nil t))
+         (run-hook-with-args 'forgejo-watch-hooks all-data)
+         (forgejo-watch--refresh-list-buffer host))))))
+
+(defun forgejo-watch--refresh-list-buffer (host)
+  "Re-render the notification list buffer for HOST if visible."
+  (when-let* ((buf (get-buffer "*forgejo-watch*")))
+    (when (get-buffer-window buf)
+      (with-current-buffer buf
+        (forgejo-watch--render host)))))
+
+;;; Global minor mode
+
+;;;###autoload
+(define-minor-mode forgejo-watch-mode
+  "Toggle Forgejo notification polling.
+Polls watch rules periodically for new items
+and runs `forgejo-watch-hooks' when new ones arrive."
+  :global t
+  :group 'forgejo
+  (if forgejo-watch-mode
+      (progn
+        (setq forgejo-watch--timer
+              (run-with-timer 0 forgejo-watch-poll-interval
+                              #'forgejo-watch--poll))
+        (add-hook 'kill-emacs-hook #'forgejo-watch--cleanup))
+    (forgejo-watch--cleanup)))
+
+(defun forgejo-watch--cleanup ()
+  "Cancel the polling timer."
+  (when forgejo-watch--timer
+    (cancel-timer forgejo-watch--timer)
+    (setq forgejo-watch--timer nil))
+  (remove-hook 'kill-emacs-hook #'forgejo-watch--cleanup))
+
+;;; Notification list buffer
+
+(defvar-local forgejo-watch--host nil
+  "Hostname for the current notification list buffer.")
+
+(defvar-local forgejo-watch--host-url nil
+  "Full URL for the current notification list buffer.")
+
+(defvar-local forgejo-watch--filters nil
+  "Current filter plist for the notification list.")
+
+(keymap-popup-define forgejo-watch-list-mode-map
+  "Forgejo watch list."
+  :parent forgejo-tl-list-mode-map
+  :group "Actions"
+  "RET" ("View" forgejo-watch-view-at-point)
+  "r" ("Mark read" forgejo-watch-mark-read-at-point)
+  "R" ("Mark all read" forgejo-watch-mark-all-read)
+  "b" ("Open in browser" forgejo-watch-browse-at-point)
+  :group "Navigate"
+  "l" ("Filter" forgejo-watch-filter)
+  "g" ("Refresh" forgejo-watch-list-refresh))
+
+(define-derived-mode forgejo-watch-list-mode tabulated-list-mode
+  "Forgejo Watch"
+  "Major mode for browsing Forgejo watch items."
+  :group 'forgejo
+  (setq tabulated-list-padding 1
+        tabulated-list-format (forgejo-view--list-format
+                               forgejo-filter-notification-columns)
+        tabulated-list-sort-key '("Updated" . t))
+  (tabulated-list-init-header)
+  (run-hook-with-args 'forgejo-buffer-setup-functions (current-buffer)))
+
+(defun forgejo-watch--render (host)
+  "Render watch items from DB for HOST into the current buffer."
+  (let* ((items (forgejo-filter-query-watch
+                 host (forgejo-watch-resolve-rules host)
+                 forgejo-watch--filters))
+         (entries (forgejo-filter-notification-entries items)))
+    (setq tabulated-list-format (forgejo-view--list-format
+                                 forgejo-filter-notification-columns)
+          tabulated-list-entries entries)
+    (tabulated-list-init-header)
+    (forgejo-tl-print t)))
+
+;;;###autoload
+(defun forgejo-watch-list ()
+  "Browse watched items.
+Shows unread items from `forgejo-watch-rules'."
+  (interactive)
+  (let* ((host-url (forgejo--resolve-host))
+         (host (url-host (url-generic-parse-url host-url)))
+         (buf (get-buffer-create "*forgejo-watch*"))
+         (default-filter
+          (forgejo-filter-parse forgejo-watch-filter-default
+                                forgejo-filter--watch-prefix-map)))
+    (with-current-buffer buf
+      (forgejo-watch-list-mode)
+      (setq forgejo-watch--host host
+            forgejo-watch--host-url host-url
+            forgejo-repo--host host-url
+            forgejo-watch--filters default-filter)
+      (forgejo-watch--render host)
+      (switch-to-buffer buf))))
+
+(defun forgejo-watch-list-refresh ()
+  "Fetch updates for watch rules, then re-render."
+  (interactive)
+  (let ((host forgejo-watch--host)
+        (host-url forgejo-watch--host-url))
+    (forgejo-watch--poll-rules host-url host)
+    (forgejo-watch--render host)))
+
+;;; Filtering
+
+(defun forgejo-watch-filter ()
+  "Filter the watch list."
+  (interactive)
+  (let* ((current (forgejo-filter-serialize
+                   forgejo-watch--filters
+                   forgejo-filter--watch-key-map))
+         (completions `((state . ("open" "closed"))
+                        (read . ("yes" "no"))
+                        (type . ("pr" "issue"))
+                        (author . nil)
+                        (label . nil)
+                        (search . nil)))
+         (query (forgejo-utils-read-filter current completions))
+         (filters (forgejo-filter-parse
+                   query forgejo-filter--watch-prefix-map)))
+    (setq forgejo-watch--filters filters)
+    (forgejo-watch--render forgejo-watch--host)))
+
+
+
+;;; Actions
+
+(defun forgejo-watch--parse-ref (ref)
+  "Parse owner/repo/number from REF.
+Reads the full ref from the `forgejo-full-ref' text property."
+  (let ((full (or (get-text-property 0 'forgejo-full-ref ref) ref)))
+    (when (string-match "\\`\\([^/]+\\)/\\([^#]+\\)#\\([0-9]+\\)\\'" full)
+      (list (match-string 1 full)
+            (match-string 2 full)
+            (string-to-number (match-string 3 full))))))
+
+(defun forgejo-watch-view-at-point ()
+  "Jump to the issue or PR for the notification at point."
+  (interactive)
+  (when-let* ((entry (tabulated-list-get-entry))
+              (type (aref entry 0))
+              (ref (aref entry 1))
+              (parsed (forgejo-watch--parse-ref ref)))
+    (let ((owner (nth 0 parsed))
+          (repo (nth 1 parsed))
+          (number (nth 2 parsed)))
+      (forgejo-db-mark-read forgejo-watch--host owner repo number)
+      (forgejo-watch--render forgejo-watch--host)
+      (if (string= type "PR")
+          (forgejo-pull-view owner repo number)
+        (forgejo-issue-view owner repo number)))))
+
+(defun forgejo-watch-mark-read-at-point ()
+  "Mark the notification at point as read."
+  (interactive)
+  (when-let* ((entry (tabulated-list-get-entry))
+              (ref (aref entry 1))
+              (parsed (forgejo-watch--parse-ref ref)))
+    (forgejo-db-mark-read forgejo-watch--host
+                          (nth 0 parsed) (nth 1 parsed) (nth 2 parsed))
+    (forgejo-watch--render forgejo-watch--host)))
+
+(defun forgejo-watch-mark-all-read ()
+  "Mark all visible watch items as read."
+  (interactive)
+  (dolist (entry tabulated-list-entries)
+    (let* ((cols (cadr entry))
+           (ref (aref cols 1))
+           (parsed (forgejo-watch--parse-ref ref)))
+      (when parsed
+        (forgejo-db-mark-read forgejo-watch--host
+                              (nth 0 parsed) (nth 1 parsed) (nth 2 parsed)))))
+  (forgejo-watch--render forgejo-watch--host))
+
+(defun forgejo-watch-browse-at-point ()
+  "Open the issue or PR at point in the browser."
+  (interactive)
+  (when-let* ((entry (tabulated-list-get-entry))
+              (type (aref entry 0))
+              (ref (aref entry 1))
+              (parsed (forgejo-watch--parse-ref ref)))
+    (let ((browse-fn (if (string= type "PR")
+                         #'forgejo-utils-browse-pull
+                       #'forgejo-utils-browse-issue)))
+      (funcall browse-fn forgejo-watch--host-url
+               (nth 0 parsed) (nth 1 parsed) (nth 2 parsed)))))
+
+(provide 'forgejo-watch)
+;;; forgejo-watch.el ends here
