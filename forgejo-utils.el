@@ -29,6 +29,7 @@
 (require 'markdown-mode)
 
 (declare-function forgejo-token "forgejo.el" (host-url))
+(defvar forgejo-markdown-mode)
 
 ;;; URL builders
 
@@ -75,6 +76,27 @@ CALLBACK is called on success."
        (lambda (_data _headers)
          (message "%sd %s/%s#%d" action owner repo number)
          (when callback (funcall callback)))))))
+
+;;; Pin toggle
+
+(defun forgejo-utils-toggle-pin (host-url owner repo number pinned-p callback)
+  "Toggle pin state of issue/PR NUMBER in OWNER/REPO on HOST-URL.
+PINNED-P is non-nil when the item is currently pinned.
+CALLBACK is called on success."
+  (let ((endpoint (format "repos/%s/%s/issues/%d/pin" owner repo number))
+        (action (if pinned-p "Unpin" "Pin")))
+    (when (y-or-n-p (format "%s %s/%s#%d? " action owner repo number))
+      (if pinned-p
+          (forgejo-api-delete
+           host-url endpoint nil
+           (lambda (_data _headers)
+             (message "Unpinned %s/%s#%d" owner repo number)
+             (when callback (funcall callback))))
+        (forgejo-api-post
+         host-url endpoint nil nil
+         (lambda (_data _headers)
+           (message "Pinned %s/%s#%d" owner repo number)
+           (when callback (funcall callback))))))))
 
 ;;; Filter prompt
 
@@ -188,10 +210,19 @@ free-text prefixes.  Returns the query string."
   "Keymap for `forgejo-compose-mode'.
 Unbinds C-c C-c so `string-edit-minor-mode' handles it.")
 
-(define-derived-mode forgejo-compose-mode gfm-mode "Forgejo Compose"
+(defvar forgejo-compose-mode-hook nil
+  "Hook run after `forgejo-compose-mode' setup.")
+
+(defun forgejo-compose-mode ()
   "Major mode for composing Forgejo comments.
-Inherits `gfm-mode' for markdown highlighting."
-  :group 'forgejo)
+Activates `forgejo-markdown-mode' for highlighting, then applies
+Forgejo-specific keybindings."
+  (funcall forgejo-markdown-mode)
+  (setq major-mode 'forgejo-compose-mode
+        mode-name "Forgejo Compose")
+  (use-local-map (make-composed-keymap forgejo-compose-mode-map
+                                       (current-local-map)))
+  (run-hooks 'forgejo-compose-mode-hook))
 
 (defun forgejo-utils-read-body (prompt &optional initial)
   "Read multi-line text with markdown highlighting and # completion.
