@@ -6,7 +6,7 @@
 ;; Keywords: tools vc git forgejo
 ;; URL: https://codeberg.org/thanosapollo/emacs-forgejo
 ;; Version: 0.1.2
-;; Package-Requires: ((emacs "29.1") (markdown-mode "2.6") (keymap-popup "0.2.1"))
+;; Package-Requires: ((emacs "29.1") (keymap-popup "0.2.1"))
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -61,13 +61,19 @@
 Each function receives the current buffer as its sole argument."
   :type '(repeat function))
 
-(defcustom forgejo-markdown-mode 'gfm-mode
+(defcustom forgejo-markdown-mode
+  (cond
+   ((fboundp 'gfm-mode) 'gfm-mode)
+   ((fboundp 'markdown-ts-mode) 'markdown-ts-mode)
+   (t 'text-mode))
   "Major mode used for markdown highlighting.
 Applied in compose buffers and for fontifying comment bodies.
-Typical choices are `gfm-mode' (from `markdown-mode' package)
-and `markdown-ts-mode' (built-in, requires tree-sitter grammars)."
+Detected automatically: `gfm-mode' if `markdown-mode' is installed,
+then `markdown-ts-mode' (built-in, requires tree-sitter grammars),
+then `text-mode' as fallback."
   :type '(choice (function-item gfm-mode)
                  (function-item markdown-ts-mode)
+                 (function-item text-mode)
                  (function :tag "Other"))
   :group 'forgejo)
 
@@ -283,17 +289,25 @@ Falls back to \"https://HOSTNAME\" if not found."
     (user-error "Host %s not configured in `forgejo-hosts'"
                 (url-host (url-generic-parse-url host-url)))))
 
+(declare-function forgejo-create-token "forgejo-token.el" (&optional host-url))
+
 (defun forgejo-token (host-url)
   "Return the API token for HOST-URL.
 Resolution order: inline token from `forgejo-hosts', auth-source,
-`forgejo-token' variable."
+`forgejo-token' variable.  When no token is found, offers to
+create one via `forgejo-create-token'."
   (forgejo--validate-host host-url)
   (or (forgejo--hosts-token host-url)
       (and forgejo-token-use-auth-source
            (forgejo--auth-source-token host-url))
       forgejo-token
-      (user-error "No token for host %s; add to `forgejo-hosts' or auth-source"
-                  (url-host (url-generic-parse-url host-url)))))
+      (if (y-or-n-p (format "No token for %s.  Create one now?"
+                            (url-host (url-generic-parse-url host-url))))
+          (or (forgejo-create-token host-url)
+              (user-error "Token creation failed for %s"
+                          (url-host (url-generic-parse-url host-url))))
+        (user-error "No token for host %s"
+                    (url-host (url-generic-parse-url host-url))))))
 
 ;;; Top-level menu
 
