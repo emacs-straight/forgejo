@@ -160,15 +160,37 @@ Also syncs repo metadata if not yet cached."
           (match-string 2 remote-url)
           (match-string 3 remote-url)))))
 
+(defun forgejo-vc--all-forge-remotes ()
+  "Return all git remotes that parse as forge URLs.
+Each element is (HOST OWNER REPO REMOTE-NAME)."
+  (cl-loop for remote in (forgejo-vc--remotes)
+           for url = (forgejo-vc--remote-url remote)
+           for parsed = (and url (forgejo-vc--parse-remote-url url))
+           when parsed collect (append parsed (list remote))))
+
+(defvar forgejo-vc--selected-remotes (make-hash-table :test 'equal)
+  "Selected remote name per repo root directory.")
+
+(defun forgejo-vc--repo-root ()
+  "Return git toplevel for `default-directory', or nil."
+  (vc-git-root default-directory))
+
+(defun forgejo-vc--selected-remote ()
+  "Return the user-selected remote for the current repo, or nil."
+  (when-let* ((root (forgejo-vc--repo-root)))
+    (gethash root forgejo-vc--selected-remotes)))
+
 (defun forgejo-vc--repo-from-remote ()
-  "Detect host, owner, repo, and remote name from any git remote.
-Tries all remotes and returns the first that parses as a forge URL.
+  "Detect host, owner, repo, and remote name from a git remote.
+When a remote has been selected via `forgejo-vc-select-remote',
+prefer that remote.  Otherwise return the first forge remote.
 Returns (HOST OWNER REPO REMOTE-NAME) or nil."
-  (cl-some (lambda (remote)
-             (when-let* ((url (forgejo-vc--remote-url remote))
-                         (parsed (forgejo-vc--parse-remote-url url)))
-               (append parsed (list remote))))
-           (forgejo-vc--remotes)))
+  (let ((all (forgejo-vc--all-forge-remotes))
+        (selected (forgejo-vc--selected-remote)))
+    (or (and selected
+             (cl-find selected all
+                      :key (lambda (r) (nth 3 r)) :test #'string=))
+        (car all))))
 
 (defun forgejo-vc--upstream-branch (branch)
   "Return the upstream remote/branch for BRANCH, or nil."
@@ -392,7 +414,7 @@ With prefix arg FORCE-PUSH-P, force-push to update an existing PR."
              (default-body (cdr defaults))
              (template (forgejo-vc--find-pr-template remote))
              (use-template (and template
-                                (y-or-n-p "PR template found. Use it? ")))
+                                (y-or-n-p "PR template found.  Use it? ")))
              (initial-body
               (cond
                ((and (not (string-empty-p default-body)) use-template)
@@ -559,7 +581,11 @@ and mark it as manually merged after a successful push."
   (not (forgejo-vc--repo-from-remote)))
 
 (keymap-popup-define forgejo-vc-map
-  "Forgejo operations for the current repository."
+  :description (lambda ()
+		 (let ((remote (forgejo-vc--repo-from-remote)))
+		   (format "Forgejo operations for %s/%s"
+			   (propertize (nth 1 remote) 'face 'font-lock-type-face)
+			   (propertize (nth 2 remote) 'face 'font-lock-type-face))))
   :group "View"
   "i" ((lambda ()
          (cond
@@ -592,7 +618,34 @@ and mark it as manually merged after a successful push."
        :inapt-if (lambda () (forgejo-vc--no-remote-p)))
   :group "Actions"
   "S" ("Settings" forgejo-settings)
-  "b" ("Browse repo" forgejo-vc-browse))
+  "b" ("Browse repo" forgejo-vc-browse)
+  "r" ((lambda ()
+         (format "Remote %s" (propertize
+                              (or (forgejo-vc--selected-remote)
+                                  (nth 3 (car (forgejo-vc--all-forge-remotes))))
+                              'face 'keymap-popup-value)))
+       forgejo-vc-select-remote
+       :if (lambda () (forgejo-vc--multiple-remotes-p))))
+
+;;; Remote selection
+
+(defun forgejo-vc--multiple-remotes-p ()
+  "Return non-nil when more than one forge remote exists."
+  (> (length (forgejo-vc--all-forge-remotes)) 1))
+
+(defun forgejo-vc-select-remote ()
+  "Select which forge remote to use for this repository."
+  (interactive)
+  (let* ((all (forgejo-vc--all-forge-remotes))
+         (candidates (mapcar (lambda (r)
+                               (format "%s (%s/%s)" (nth 3 r) (nth 1 r) (nth 2 r)))
+                             all))
+         (choice (completing-read "Remote: " candidates nil t))
+         (idx (cl-position choice candidates :test #'string=))
+         (root (forgejo-vc--repo-root)))
+    (puthash root (nth 3 (nth idx all)) forgejo-vc--selected-remotes)
+    (setq forgejo-vc--repo-key nil)
+    (keymap-popup forgejo-vc-map)))
 
 ;;;###autoload
 (defun forgejo-vc ()

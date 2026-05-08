@@ -5,7 +5,7 @@
 ;; Author: Thanos Apollo <public@thanosapollo.org>
 ;; Keywords: tools vc git forgejo
 ;; URL: https://codeberg.org/thanosapollo/emacs-forgejo
-;; Version: 0.1.4
+;; Version: 0.1.6
 ;; Package-Requires: ((emacs "29.1") (keymap-popup "0.2.1"))
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -325,6 +325,7 @@ create one via `forgejo-create-token'."
 
 (keymap-popup-define forgejo-map
   "Forgejo."
+  :description "Forgejo Menu"
   :group "Navigate"
   "s" ("Search repos" forgejo-repo-search)
   "i" ("Issues" forgejo-issue-list)
