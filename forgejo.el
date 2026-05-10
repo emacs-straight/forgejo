@@ -5,7 +5,7 @@
 ;; Author: Thanos Apollo <public@thanosapollo.org>
 ;; Keywords: tools vc git forgejo
 ;; URL: https://codeberg.org/thanosapollo/emacs-forgejo
-;; Version: 0.1.6
+;; Version: 0.1.7
 ;; Package-Requires: ((emacs "29.1") (keymap-popup "0.2.1"))
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -318,6 +318,7 @@ create one via `forgejo-create-token'."
                   (&optional owner repo))
 (declare-function forgejo-repo-create "forgejo-repo.el" (name))
 (declare-function forgejo-watch-list "forgejo-watch.el" ())
+(declare-function forgejo-notification-list "forgejo-notification.el" ())
 (declare-function forgejo-utils-browse-repo "forgejo-utils.el"
                   (host-url owner repo))
 
@@ -331,6 +332,7 @@ create one via `forgejo-create-token'."
   "i" ("Issues" forgejo-issue-list)
   "p" ("Pull requests" forgejo-pull-list)
   "n" ("Watch" forgejo-watch-list)
+  "N" ("Notifications" forgejo-notification-list)
   :group "Actions"
   "c" ("Create repo" forgejo-repo-create)
   "b" ("Browse repo" forgejo-browse-repo))

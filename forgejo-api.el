@@ -36,7 +36,7 @@
 (declare-function forgejo-token "forgejo.el" (host-url))
 (defvar forgejo--api-default-limit)
 
-(defcustom forgejo-api-timeout 30
+(defcustom forgejo-api-timeout 120
   "Seconds before an async API request times out.
 When nil, no timeout is enforced."
   :type '(choice (integer :tag "Seconds")
@@ -156,6 +156,18 @@ Returns the parsed JSON as alists/lists, or nil for empty bodies."
   "Return the cached rate-limit plist for HOST, or nil."
   (gethash host forgejo-api--rate-limit-state))
 
+(defun forgejo-api--rate-limited-p (host)
+  "Return non-nil if HOST is known to be rate-limited."
+  (when-let* ((state (gethash host forgejo-api--rate-limit-state)))
+    (let ((remaining (plist-get state :remaining))
+          (reset (plist-get state :reset)))
+      (and remaining reset
+           (= remaining 0)
+           (> reset (float-time))))))
+
+(defvar forgejo-api--rate-limit-logged nil
+  "Hosts for which a rate-limit message has been logged this window.")
+
 ;;; Error helpers
 
 (defun forgejo-api--error-plist (http-status method endpoint message data)
@@ -233,7 +245,16 @@ otherwise log a human-readable message."
         ('net-error
          (message "Forgejo API error: %s" (plist-get result :message)))
         ('timeout
-         (message "Forgejo API timeout: %s %s" method endpoint))))))
+         (message "Forgejo API timeout: %s %s" method endpoint))
+        ('rate-limited
+         (let ((host (plist-get result :host)))
+           (unless (member host forgejo-api--rate-limit-logged)
+             (push host forgejo-api--rate-limit-logged)
+             (message "Forgejo API: rate-limited for %s (resets %s)"
+                      host (forgejo-api--format-reset-time
+                            (plist-get
+                             (gethash host forgejo-api--rate-limit-state)
+                             :reset))))))))))
 
 (defun forgejo-api--act-on-response (result host method endpoint
                                             callback error-callback)
@@ -245,14 +266,32 @@ Updates rate-limit state when headers are present."
       (forgejo-api--check-rate-limit host headers))
     (pcase (plist-get result :kind)
       ('success
+       (setq forgejo-api--rate-limit-logged
+             (delete host forgejo-api--rate-limit-logged))
        (when callback
          (funcall callback (plist-get result :data) headers)))
       ('not-modified
+       (setq forgejo-api--rate-limit-logged
+             (delete host forgejo-api--rate-limit-logged))
        (when callback
          (funcall callback nil headers)))
       ((or 'http-error 'net-error)
+       (when (and (eq (plist-get result :kind) 'http-error)
+                  (= (plist-get result :status) 403)
+                  (null (plist-get headers :rate-limit-remaining)))
+         (puthash host (list :remaining 0 :limit 0
+                             :reset (+ (float-time) 300))
+                  forgejo-api--rate-limit-state))
        (forgejo-api--report-error
         method endpoint result error-callback)))))
+
+(defun forgejo-api--kill-url-buffer (buf)
+  "Kill url-retrieve buffer BUF, suppressing process query prompts."
+  (when (buffer-live-p buf)
+    (let ((proc (get-buffer-process buf)))
+      (when proc (delete-process proc)))
+    (let (kill-buffer-query-functions)
+      (kill-buffer buf))))
 
 (defun forgejo-api--dispatch-response (status host method endpoint
                                               callback error-callback
@@ -270,8 +309,7 @@ TIMER-CELL is a cons cell whose car holds the timeout timer."
                        status (current-buffer))))
           (forgejo-api--act-on-response
            result host method endpoint callback error-callback))
-      (when (buffer-live-p (current-buffer))
-        (kill-buffer (current-buffer))))))
+      (forgejo-api--kill-url-buffer (current-buffer)))))
 
 (defun forgejo-api--start-timeout (completed url-buf method endpoint
                                              error-callback)
@@ -284,10 +322,7 @@ Returns the timer object."
    (lambda ()
      (unless (car completed)
        (setcar completed t)
-       (when (buffer-live-p url-buf)
-         (let ((proc (get-buffer-process url-buf)))
-           (when proc (delete-process proc)))
-         (kill-buffer url-buf))
+       (forgejo-api--kill-url-buffer url-buf)
        (forgejo-api--report-error
         method endpoint '(:kind timeout) error-callback)))))
 
@@ -311,10 +346,7 @@ ENTRY is (COMPLETED TIMER-CELL . URL-BUF)."
       (setcar completed t)
       (let ((timer (car timer-cell)))
         (when timer (cancel-timer timer)))
-      (when (buffer-live-p url-buf)
-        (let ((proc (get-buffer-process url-buf)))
-          (when proc (delete-process proc)))
-        (kill-buffer url-buf)))))
+      (forgejo-api--kill-url-buffer url-buf))))
 
 (defun forgejo-api-reset ()
   "Cancel all in-flight Forgejo API requests and flush idle connections.
@@ -363,34 +395,37 @@ ARGS is a plist of keyword options:
   :if-none-match -- ETag value for conditional requests.
   :if-modified-since -- date string for conditional requests.
     On 304 Not Modified, CALLBACK receives nil data."
-  (let* ((error-callback (plist-get args :error-callback))
-         (completed (cons nil nil))
-         (timer-cell (cons nil nil))
-         (url-request-method method)
-         (url-request-extra-headers
-          (forgejo-api--build-headers
-           host json-body
-           (plist-get args :if-none-match)
-           (plist-get args :if-modified-since)))
-         (url-request-data
-          (when json-body
-            (encode-coding-string (json-encode json-body) 'utf-8)))
-         (url (forgejo-api--url host endpoint params))
-         (url-buf
-          (url-retrieve
-           url #'forgejo-api--dispatch-response
-           (list host method endpoint
-                 callback error-callback
-                 completed timer-cell)
-           t)))
-    (when url-buf
-      (when-let* ((proc (get-buffer-process url-buf)))
-        (set-process-query-on-exit-flag proc nil))
-      (forgejo-api--register-request completed timer-cell url-buf)
-      (when forgejo-api-timeout
-        (setcar timer-cell
-                (forgejo-api--start-timeout
-                 completed url-buf method endpoint error-callback))))))
+  (let ((error-callback (plist-get args :error-callback)))
+    (if (forgejo-api--rate-limited-p host)
+        (forgejo-api--report-error
+         method endpoint (list :kind 'rate-limited :host host) error-callback)
+      (let* ((completed (cons nil nil))
+             (timer-cell (cons nil nil))
+             (url-request-method method)
+             (url-request-extra-headers
+              (forgejo-api--build-headers
+               host json-body
+               (plist-get args :if-none-match)
+               (plist-get args :if-modified-since)))
+             (url-request-data
+              (when json-body
+		(encode-coding-string (json-encode json-body) 'utf-8)))
+             (url (forgejo-api--url host endpoint params))
+             (url-buf
+              (url-retrieve
+               url #'forgejo-api--dispatch-response
+               (list host method endpoint
+                     callback error-callback
+                     completed timer-cell)
+               t)))
+	(when url-buf
+          (when-let* ((proc (get-buffer-process url-buf)))
+            (set-process-query-on-exit-flag proc nil))
+          (forgejo-api--register-request completed timer-cell url-buf)
+          (when forgejo-api-timeout
+            (setcar timer-cell
+                    (forgejo-api--start-timeout
+                     completed url-buf method endpoint error-callback))))))))
 
 ;;; Public wrappers
 

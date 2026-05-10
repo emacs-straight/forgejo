@@ -31,6 +31,7 @@
 (require 'cl-lib)
 (require 'diff-mode)
 (require 'ewoc)
+(require 'text-property-search)
 (require 'url-parse)
 (require 'keymap-popup)
 (require 'forgejo)
@@ -122,7 +123,7 @@ Uses the ref-repo text property for cross-repo references."
   (with-current-buffer (get-buffer-create buf-name)
     (let ((inhibit-read-only t))
       (erase-buffer)
-      (insert text))
+      (insert (decode-coding-string text 'utf-8 t)))
     (diff-mode)
     (use-local-map forgejo-view-diff-map)
     (setq buffer-read-only t)
@@ -158,13 +159,15 @@ Tries local git first, falls back to the API."
     (url-retrieve
      url
      (lambda (_status)
-       (goto-char (point-min))
-       (re-search-forward "\r?\n\r?\n" nil t)
-       (let ((diff-text (buffer-substring-no-properties (point) (point-max))))
-         (kill-buffer (current-buffer))
-         (if (string-empty-p (string-trim diff-text))
-             (user-error "Commit %s not found" sha)
-           (forgejo-view--show-diff-buffer buf-name diff-text))))
+       (unwind-protect
+           (progn
+             (goto-char (point-min))
+             (re-search-forward "\r?\n\r?\n" nil t)
+             (let ((diff-text (buffer-substring-no-properties (point) (point-max))))
+               (if (string-empty-p (string-trim diff-text))
+                   (user-error "Commit %s not found" sha)
+                 (forgejo-view--show-diff-buffer buf-name diff-text))))
+         (forgejo-api--kill-url-buffer (current-buffer))))
      nil t)))
 
 (defun forgejo-view-compare-diff ()
@@ -189,13 +192,15 @@ Tries local git first, falls back to the API."
       (url-retrieve
        url
        (lambda (_status)
-         (goto-char (point-min))
-         (re-search-forward "\r?\n\r?\n" nil t)
-         (let ((diff-text (buffer-substring-no-properties (point) (point-max))))
-           (kill-buffer (current-buffer))
-           (if (string-empty-p (string-trim diff-text))
-               (message "No diff between %s and %s" short-old short-new)
-             (forgejo-view--show-diff-buffer buf-name diff-text))))
+         (unwind-protect
+             (progn
+               (goto-char (point-min))
+               (re-search-forward "\r?\n\r?\n" nil t)
+               (let ((diff-text (buffer-substring-no-properties (point) (point-max))))
+                 (if (string-empty-p (string-trim diff-text))
+                     (message "No diff between %s and %s" short-old short-new)
+                   (forgejo-view--show-diff-buffer buf-name diff-text))))
+           (forgejo-api--kill-url-buffer (current-buffer))))
        nil t))))
 
 ;;; URL routing
@@ -245,6 +250,22 @@ Handles #N issue/PR refs and markdown URLs."
   (interactive)
   (ewoc-goto-prev forgejo-view--ewoc 1))
 
+;;; Link navigation
+
+(defun forgejo-view-next-link ()
+  "Move to the next link in the buffer."
+  (interactive)
+  (if-let* ((match (text-property-search-forward 'keymap nil nil t)))
+      (goto-char (prop-match-beginning match))
+    (message "No next link")))
+
+(defun forgejo-view-previous-link ()
+  "Move to the previous link in the buffer."
+  (interactive)
+  (if-let* ((match (text-property-search-backward 'keymap nil nil t)))
+      (goto-char (prop-match-beginning match))
+    (message "No previous link")))
+
 ;;; Shared view keymap
 
 (keymap-popup-define forgejo-view-mode-map
@@ -255,6 +276,8 @@ Handles #N issue/PR refs and markdown URLs."
   "e" ("Edit at point" forgejo-view-edit)
   "x" ("Toggle open/close" forgejo-view-toggle-state)
   "D" ("Delete at point" forgejo-view-delete-at-point)
+  "b" ("Open in browser" forgejo-view-browse)
+  "g" ("Refresh" forgejo-view-refresh)
   :group "Metadata"
   "L" ("Add label" forgejo-view-add-label)
   "A" ("Add assignee" forgejo-view-add-assignee)
@@ -262,8 +285,8 @@ Handles #N issue/PR refs and markdown URLs."
   "P" ("Toggle pin" forgejo-view-toggle-pin)
   :group "Navigate"
   "RET" ("Follow link" forgejo-view-follow-link)
-  "g" ("Refresh" forgejo-view-refresh)
-  "b" ("Open in browser" forgejo-view-browse)
+  "TAB" ("Next link" forgejo-view-next-link)
+  "<backtab>" ("Prev link" forgejo-view-previous-link)
   "n" ("Next" forgejo-view-next)
   "p" ("Previous" forgejo-view-previous))
 
@@ -449,24 +472,55 @@ Updates the API, then updates pin_order in the DB."
                 forgejo-repo--owner forgejo-repo--name number)
        (funcall refresh)))))
 
-(defun forgejo-view-edit ()
-  "Edit the item at point.
-On the header, prompts for title or body.  On a comment, edits the body."
+(defun forgejo-view-edit-title ()
+  "Edit the title of the current item."
   (interactive)
   (when-let* ((node (forgejo-view--node-at-point))
-              (data forgejo-view--data)
-              (number (alist-get 'number data)))
+              (number (alist-get 'number forgejo-view--data)))
+    (forgejo-utils-edit-title
+     forgejo-repo--host forgejo-repo--owner forgejo-repo--name number
+     (plist-get node :title)
+     (forgejo--post-action-callback))))
+
+(defun forgejo-view-edit-body ()
+  "Edit the body of the current item."
+  (interactive)
+  (when-let* ((node (forgejo-view--node-at-point))
+              (number (alist-get 'number forgejo-view--data)))
+    (forgejo-utils-edit-body
+     forgejo-repo--host forgejo-repo--owner forgejo-repo--name number
+     (plist-get node :body)
+     (forgejo--post-action-callback))))
+
+(defun forgejo-view-edit-base ()
+  "Change the base branch of the current pull request."
+  (interactive)
+  (when-let* ((number (alist-get 'number forgejo-view--data)))
+    (forgejo-utils-edit-base
+     forgejo-repo--host forgejo-repo--owner forgejo-repo--name number
+     (forgejo--post-action-callback))))
+
+(keymap-popup-define forgejo-view-edit-map
+  :description (lambda ()
+                 (if-let* ((num (and (bound-and-true-p forgejo-view--data)
+                                     (alist-get 'number forgejo-view--data))))
+                     (concat "Edit "
+                             (propertize (concat "#" (number-to-string num))
+                                         'face 'font-lock-constant-face))
+                   "Edit"))
+  :group "Actions"
+  "t" ("Title" forgejo-view-edit-title)
+  "b" ("Body" forgejo-view-edit-body)
+  "B" ("Base branch" forgejo-view-edit-base
+       :if (lambda () (alist-get 'pull_request forgejo-view--data))))
+
+(defun forgejo-view-edit ()
+  "Edit the item at point.
+On the header, shows edit menu.  On a comment, edits the body."
+  (interactive)
+  (when-let* ((node (forgejo-view--node-at-point)))
     (pcase (plist-get node :type)
-      ('header
-       (pcase (car (read-multiple-choice "Edit" '((?t "title") (?b "body"))))
-         (?t (forgejo-utils-edit-title
-              forgejo-repo--host forgejo-repo--owner forgejo-repo--name number
-              (plist-get node :title)
-              (forgejo--post-action-callback)))
-         (?b (forgejo-utils-edit-body
-              forgejo-repo--host forgejo-repo--owner forgejo-repo--name number
-              (plist-get node :body)
-              (forgejo--post-action-callback)))))
+      ('header (keymap-popup forgejo-view-edit-map))
       ('comment
        (forgejo-utils-edit-comment
         forgejo-repo--host forgejo-repo--owner forgejo-repo--name

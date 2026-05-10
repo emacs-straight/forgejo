@@ -314,7 +314,7 @@ Returns 0 if UPSTREAM is not a valid ref."
      (t
       (let ((subjects (forgejo-vc--commit-subjects upstream)))
         (cons (forgejo-vc--head-subject)
-              (mapconcat #'identity subjects "\n")))))))
+              (string-join subjects "\n")))))))
 
 ;;; PR template discovery
 
@@ -582,10 +582,11 @@ and mark it as manually merged after a successful push."
 
 (keymap-popup-define forgejo-vc-map
   :description (lambda ()
-		 (let ((remote (forgejo-vc--repo-from-remote)))
-		   (format "Forgejo operations for %s/%s"
-			   (propertize (nth 1 remote) 'face 'font-lock-type-face)
-			   (propertize (nth 2 remote) 'face 'font-lock-type-face))))
+		 (if-let* ((remote (forgejo-vc--repo-from-remote)))
+		     (format "Forgejo operations for %s/%s"
+			     (propertize (nth 1 remote) 'face 'font-lock-type-face)
+			     (propertize (nth 2 remote) 'face 'font-lock-type-face))
+		   "Forgejo operations"))
   :group "View"
   "i" ((lambda ()
          (cond
