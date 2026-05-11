@@ -5,7 +5,7 @@
 ;; Author: Thanos Apollo <public@thanosapollo.org>
 ;; Keywords: tools vc git forgejo
 ;; URL: https://codeberg.org/thanosapollo/emacs-forgejo
-;; Version: 0.1.7
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "29.1") (keymap-popup "0.2.1"))
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -323,6 +323,8 @@ create one via `forgejo-create-token'."
                   (host-url owner repo))
 
 (defvar forgejo-repo--host)
+(defvar forgejo-repo--owner)
+(defvar forgejo-repo--name)
 
 (keymap-popup-define forgejo-map
   "Forgejo."
@@ -359,7 +361,14 @@ create one via `forgejo-create-token'."
 (declare-function forgejo-repo-search--owner-repo-at-point "forgejo-repo.el" ())
 
 (keymap-popup-define forgejo-repo-action-map
-  "Actions for repository at point."
+  :description (lambda ()
+                 (if (and (bound-and-true-p forgejo-repo--owner)
+                          (bound-and-true-p forgejo-repo--name))
+                     (concat "Repo "
+                             (propertize (format "%s/%s" forgejo-repo--owner
+                                                 forgejo-repo--name)
+                                         'face 'font-lock-type-face))
+                   "Repo"))
   :group "Open"
   "i" ("Issues" forgejo-repo-action--issues)
   "p" ("Pull requests" forgejo-repo-action--pulls)

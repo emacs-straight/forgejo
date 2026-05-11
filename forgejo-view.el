@@ -53,6 +53,10 @@
 (defvar-local forgejo-view--data nil
   "Item alist for the current detail view (issue or PR).")
 
+(defconst forgejo-view--reaction-types
+  '("+1" "-1" "laugh" "hooray" "confused" "heart" "rocket" "eyes")
+  "The 8 reaction types supported by Forgejo.")
+
 (defvar-local forgejo-view--ewoc nil
   "EWOC instance for the current detail view.")
 
@@ -63,6 +67,27 @@ Called with (HOST OWNER REPO NUMBER BUF-NAME &optional RESTORE-LINE).")
 (defvar-local forgejo-view--browse-fn nil
   "Function to open the current item in the browser.
 Called with (HOST-URL OWNER REPO NUMBER).")
+
+(defun forgejo-view--popup-description (prefix &optional filters)
+  "Return a popup description string: PREFIX owner/repo#NUM.
+Falls back to PREFIX owner/repo or just PREFIX.
+When FILTERS is a non-nil plist, appends the serialized filter string."
+  (let ((owner (and (bound-and-true-p forgejo-repo--owner) forgejo-repo--owner))
+        (repo (and (bound-and-true-p forgejo-repo--name) forgejo-repo--name))
+        (num (and (bound-and-true-p forgejo-view--data)
+                  (alist-get 'number forgejo-view--data)))
+        (filter-str (and filters
+                         (forgejo-filter-serialize filters))))
+    (concat prefix
+            (when (and owner repo)
+              (concat " "
+                      (propertize (format "%s/%s" owner repo)
+                                  'face 'font-lock-type-face)
+                      (when num
+                        (propertize (format "#%d" num)
+                                    'face 'font-lock-constant-face))))
+            (when (and filter-str (not (string-empty-p filter-str)))
+              (concat " " filter-str)))))
 
 ;;; Text-property action map
 
@@ -109,7 +134,17 @@ Uses the ref-repo text property for cross-repo references."
 (declare-function forgejo-review-diff-comment "forgejo-review.el" ())
 
 (keymap-popup-define forgejo-view-diff-map
-  "Forgejo diff."
+  :description (lambda ()
+                 (if (and forgejo-diff--owner forgejo-diff--repo
+                          forgejo-diff--pr-number)
+                     (concat "Diff "
+                             (propertize (format "%s/%s"
+                                                 forgejo-diff--owner
+                                                 forgejo-diff--repo)
+                                         'face 'font-lock-type-face)
+                             (propertize (format "#%d" forgejo-diff--pr-number)
+                                         'face 'font-lock-constant-face))
+                   "Diff"))
   :parent diff-mode-map
   "q" ("Quit" quit-window)
   "c" ("Review comment" forgejo-review-diff-comment))
@@ -269,7 +304,7 @@ Handles #N issue/PR refs and markdown URLs."
 ;;; Shared view keymap
 
 (keymap-popup-define forgejo-view-mode-map
-  "Forgejo detail view."
+  :description (lambda () (forgejo-view--popup-description "Forgejo"))
   :parent special-mode-map
   :group "Actions"
   "c" ("Comment" forgejo-view-comment)
@@ -279,7 +314,8 @@ Handles #N issue/PR refs and markdown URLs."
   "b" ("Open in browser" forgejo-view-browse)
   "g" ("Refresh" forgejo-view-refresh)
   :group "Metadata"
-  "L" ("Add label" forgejo-view-add-label)
+  "!" ("React" forgejo-view-react)
+  "L" ("Labels" forgejo-view-label)
   "A" ("Add assignee" forgejo-view-add-assignee)
   "M" ("Set milestone" forgejo-view-set-milestone)
   "P" ("Toggle pin" forgejo-view-toggle-pin)
@@ -397,6 +433,44 @@ SYNC-FN and BROWSE-FN are stored as buffer-locals for action commands."
       (goto-char (point-min))
       (set-buffer-modified-p nil)
       (current-buffer))))
+
+;;; Reaction sync
+
+(defun forgejo-view--sync-reactions (host-url host owner repo number
+                                              buf-name timeline)
+  "Fetch reactions for issue NUMBER and its comments, update EWOC.
+Fires all requests in parallel.  TIMELINE is the list of timeline
+event alists (used to extract comment IDs)."
+  (let* ((comment-ids (cl-loop for event in timeline
+                               when (string= "comment"
+                                             (alist-get 'type event))
+                               collect (alist-get 'id event)))
+         (remaining (cons (1+ (length comment-ids)) nil))
+         (finish (lambda ()
+                   (when (zerop (cl-decf (car remaining)))
+                     (when (buffer-live-p (get-buffer buf-name))
+                       (with-current-buffer buf-name
+                         (forgejo-buffer--update-reactions
+                          forgejo-view--ewoc host owner repo number)))))))
+    ;; Issue body reactions
+    (forgejo-api-get
+     host-url
+     (format "repos/%s/%s/issues/%d/reactions" owner repo number)
+     nil
+     (lambda (data _headers)
+       (forgejo-db-save-reactions host owner repo number 0 data)
+       (funcall finish))
+     :error-callback (lambda (_err) (funcall finish)))
+    ;; Comment reactions (parallel)
+    (dolist (cid comment-ids)
+      (forgejo-api-get
+       host-url
+       (format "repos/%s/%s/issues/comments/%d/reactions" owner repo cid)
+       nil
+       (lambda (data _headers)
+         (forgejo-db-save-reactions host owner repo number cid data)
+         (funcall finish))
+       :error-callback (lambda (_err) (funcall finish))))))
 
 ;;; Re-render from DB
 
@@ -528,26 +602,89 @@ On the header, shows edit menu.  On a comment, edits the body."
         (forgejo--post-action-callback)))
       (_ (user-error "No editable item at point")))))
 
-(defun forgejo-view-add-label ()
-  "Add a label to the current item."
+(defun forgejo-view-label ()
+  "Add or remove labels on the current item.
+Works from both detail and list views."
   (interactive)
-  (when-let* ((data forgejo-view--data)
-              (number (alist-get 'number data))
+  (when-let* ((number (or (and (bound-and-true-p forgejo-view--data)
+                               (alist-get 'number forgejo-view--data))
+                          (tabulated-list-get-id)))
               (host (url-host (url-generic-parse-url forgejo-repo--host))))
-    (forgejo-utils-add-label
-     forgejo-repo--host forgejo-repo--owner forgejo-repo--name number host
-     (forgejo--post-action-callback))))
+    (forgejo-utils-label
+     forgejo-repo--host forgejo-repo--owner forgejo-repo--name
+     number host (forgejo--post-action-callback))))
 
-(defun forgejo-view-remove-label ()
-  "Remove a label from the current item."
+(defun forgejo-view-react ()
+  "Add or remove reactions on the comment or issue body at point.
+Each reaction type is prefixed with + (to add) or - (to remove)."
   (interactive)
-  (when-let* ((data forgejo-view--data)
-              (number (alist-get 'number data))
-              (labels (alist-get 'labels data))
-              (host (url-host (url-generic-parse-url forgejo-repo--host))))
-    (forgejo-utils-remove-label
-     forgejo-repo--host forgejo-repo--owner forgejo-repo--name number labels
-     host (forgejo--post-action-callback))))
+  (when-let* ((node (forgejo-view--node-at-point))
+              (type (plist-get node :type))
+              (number (alist-get 'number forgejo-view--data))
+              (host-url forgejo-repo--host)
+              (host (url-host (url-generic-parse-url host-url)))
+              (owner forgejo-repo--owner)
+              (repo forgejo-repo--name))
+    (let* ((comment-id (pcase type
+                         ('header 0)
+                         ('comment (plist-get node :id))
+                         (_ (user-error "No reactable item at point"))))
+           (current (plist-get node :reactions))
+           (current-types (mapcar #'car current))
+           (candidates (mapcar (lambda (r)
+                                 (if (member r current-types)
+                                     (concat "-" r)
+                                   (concat "+" r)))
+                               forgejo-view--reaction-types))
+           (selected (mapcar #'string-trim
+                             (completing-read-multiple
+                              "Reactions (+add -remove): "
+                              candidates nil nil)))
+           (endpoint (if (= comment-id 0)
+                         (format "repos/%s/%s/issues/%d/reactions"
+                                 owner repo number)
+                       (format "repos/%s/%s/issues/comments/%d/reactions"
+                               owner repo comment-id)))
+           (buf-name (buffer-name)))
+      (dolist (sel selected)
+        (let ((op (substring sel 0 1))
+              (content (substring sel 1)))
+          (pcase op
+            ("+"
+             (forgejo-api-post
+              host-url endpoint nil
+              `((content . ,content))
+              (lambda (_data _headers)
+                (message "Added %s reaction" content)
+                (forgejo-view--refresh-reactions
+                 host-url host owner repo number comment-id buf-name))))
+            ("-"
+             (forgejo-api-delete
+              host-url endpoint
+              `((content . ,content))
+              (lambda (_data _headers)
+                (message "Removed %s reaction" content)
+                (forgejo-view--refresh-reactions
+                 host-url host owner repo number comment-id buf-name))))
+            (_
+             (user-error "Invalid reaction: %s (use +name or -name)" sel))))))))
+
+(defun forgejo-view--refresh-reactions (host-url host owner repo number
+                                                 comment-id buf-name)
+  "Refetch reactions for COMMENT-ID and update the EWOC node."
+  (let ((endpoint (if (= comment-id 0)
+                      (format "repos/%s/%s/issues/%d/reactions"
+                              owner repo number)
+                    (format "repos/%s/%s/issues/comments/%d/reactions"
+                            owner repo comment-id))))
+    (forgejo-api-get
+     host-url endpoint nil
+     (lambda (data _headers)
+       (forgejo-db-save-reactions host owner repo number comment-id data)
+       (when (buffer-live-p (get-buffer buf-name))
+         (with-current-buffer buf-name
+           (forgejo-buffer--update-reactions
+            forgejo-view--ewoc host owner repo number)))))))
 
 (defun forgejo-view-add-assignee ()
   "Add an assignee to the current item."
