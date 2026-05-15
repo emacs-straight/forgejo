@@ -28,6 +28,7 @@
 ;;; Code:
 
 (require 'browse-url)
+(require 'bug-reference)
 (require 'cl-lib)
 (require 'diff-mode)
 (require 'ewoc)
@@ -160,13 +161,20 @@ PR-NUMBER, when non-nil, marks this as a PR diff for review comments."
     (let ((inhibit-read-only t))
       (erase-buffer)
       (insert (decode-coding-string text 'utf-8 t)))
+    (setq buffer-read-only t)
     (diff-mode)
     (use-local-map forgejo-view-diff-map)
+    ;; HACK: diff-mode-read-only-map shadows our popup key "h" with
+    ;; describe-mode.  Override just that binding via the higher-priority
+    ;; minor-mode-overriding-map-alist, keyed on buffer-read-only.
+    (let ((map (make-sparse-keymap)))
+      (keymap-set map "h" (lambda () (interactive) (keymap-popup forgejo-view-diff-map)))
+      (setq-local minor-mode-overriding-map-alist
+                  (list (cons 'buffer-read-only map))))
     (setq forgejo-repo--host host-url
           forgejo-repo--owner owner
           forgejo-repo--name repo
-          forgejo-diff--pr-number pr-number
-          buffer-read-only t)
+          forgejo-diff--pr-number pr-number)
     (goto-char (point-min))
     (switch-to-buffer (current-buffer))))
 
@@ -261,9 +269,63 @@ Tries local git first, falls back to the API."
 
 (defun forgejo-view-browse-url (url &rest _args)
   "Open URL in forgejo.el if it's a Forgejo issue/PR, else in browser."
-  (if-let* ((parsed (forgejo-view--parse-forgejo-url url)))
+  (if-let* ((parsed (forgejo-view--parse-forgejo-url url))
+            (url-obj (url-generic-parse-url url))
+            (forgejo-repo--host (format "%s://%s"
+                                        (url-type url-obj)
+                                        (url-host url-obj))))
       (forgejo-view-item (nth 0 parsed) (nth 1 parsed) (nth 2 parsed))
     (browse-url-default-browser url)))
+
+(defun forgejo-view--browse-url-handler (url &rest _args)
+  "Handle URL if it points to a Forgejo issue or PR.
+Returns non-nil if handled, nil otherwise.  Only matches hosts
+configured in `forgejo-hosts'."
+  (when-let* ((parsed (forgejo-view--parse-forgejo-url url))
+              (url-obj (url-generic-parse-url url))
+              (host (url-host url-obj))
+              (known (cl-find host forgejo-hosts
+                               :key (lambda (e)
+                                      (url-host
+                                       (url-generic-parse-url (car e))))
+                               :test #'string=))
+              (forgejo-repo--host (format "%s://%s"
+                                          (url-type url-obj) host)))
+    (forgejo-view-item (nth 0 parsed) (nth 1 parsed) (nth 2 parsed))
+    t))
+
+;;;###autoload
+(define-minor-mode forgejo-browse-mode
+  "Open Forgejo issue/PR URLs in forgejo.el instead of the browser.
+When enabled, URLs matching configured `forgejo-hosts' are opened
+in forgejo.el buffers rather than the web browser."
+  :lighter " Forgejo"
+  (if forgejo-browse-mode
+      (add-function :before-until (local 'browse-url-browser-function)
+                    #'forgejo-view--browse-url-handler)
+    (remove-function (local 'browse-url-browser-function)
+                     #'forgejo-view--browse-url-handler)))
+
+;;;###autoload
+(define-globalized-minor-mode global-forgejo-browse-mode
+  forgejo-browse-mode forgejo-browse-mode
+  :group 'forgejo)
+
+;;; bug-reference-forge-alist integration
+
+(defvar forgejo-view--added-forge-hosts nil
+  "Hosts added to `bug-reference-forge-alist' by forgejo.el.")
+
+(defun forgejo-view--bug-reference-setup ()
+  "Add `forgejo-hosts' entries to `bug-reference-forge-alist'."
+  (dolist (entry forgejo-hosts)
+    (let* ((url-obj (url-generic-parse-url (car entry)))
+           (host-domain (url-host url-obj))
+           (protocol (url-type url-obj)))
+      (unless (assoc host-domain bug-reference-forge-alist)
+        (push host-domain forgejo-view--added-forge-hosts)
+        (push (list host-domain 'gitea protocol)
+              bug-reference-forge-alist)))))
 
 (defun forgejo-view-follow-link ()
   "Follow the link at point.
@@ -806,6 +868,8 @@ Removes from API, then from DB, then re-renders the list in place."
      (lambda (_data _headers)
        (message "Deleted %s" description)
        (when callback (funcall callback))))))
+
+(forgejo-view--bug-reference-setup)
 
 (provide 'forgejo-view)
 ;;; forgejo-view.el ends here
