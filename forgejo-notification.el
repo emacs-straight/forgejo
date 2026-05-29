@@ -149,6 +149,15 @@ Handles API URLs like /api/v1/repos/OWNER/REPO/issues/N."
 
 ;;; Sync
 
+(defvar forgejo-notification-fetch-batch-size 10
+  "Number of missing issues to fetch before pausing.
+A 3-second pause is inserted between batches to avoid triggering
+infrastructure-level rate limits.")
+
+(defvar forgejo-notification-fetch-max-per-sync 30
+  "Max missing issues to fetch per sync cycle.
+Remaining ones are picked up on subsequent polls.")
+
 (defun forgejo-notification--sync (host-url host &optional callback)
   "Fetch notifications from HOST-URL, save to DB, fetch missing issues.
 CALLBACK is called with no args when done."
@@ -194,15 +203,6 @@ Fires `forgejo-notification-hooks' for unread items in this page."
                        (lambda (r) (= (alist-get 'unread r) 1)) rows)))
           (when unread
             (run-hook-with-args 'forgejo-notification-hooks unread)))))))
-
-(defvar forgejo-notification-fetch-batch-size 10
-  "Number of missing issues to fetch before pausing.
-A 3-second pause is inserted between batches to avoid triggering
-infrastructure-level rate limits.")
-
-(defvar forgejo-notification-fetch-max-per-sync 30
-  "Max missing issues to fetch per sync cycle.
-Remaining ones are picked up on subsequent polls.")
 
 (defun forgejo-notification--fetch-missing (host-url host missing &optional count)
   "Fetch MISSING issues ((OWNER REPO NUMBER) ...) sequentially.
@@ -275,6 +275,7 @@ CALLBACK is called with no args when done."
   "u" ("Mark unread" forgejo-notification-mark-unread)
   "p" ("Toggle pin" forgejo-notification-toggle-pin)
   "R" ("Mark all read" forgejo-notification-mark-all-read)
+  "U" ("Toggle subscription" forgejo-view-toggle-subscription)
   "b" ("Open in browser" forgejo-notification-browse-at-point)
   "g" ("Refresh" forgejo-notification-refresh)
   :group "Navigate"
@@ -331,10 +332,16 @@ Renders instantly from DB, then syncs in background."
             (string-to-number (match-string 3 full))))))
 
 (defun forgejo-notification-view-at-point ()
-  "Navigate to the subject of the notification at point."
+  "Navigate to the subject of the notification at point.
+Marks the notification as read on both the local DB and the server."
   (interactive)
   (when-let* ((entry (tabulated-list-get-entry))
-              (parsed (forgejo-notification--parse-ref-at-point)))
+              (parsed (forgejo-notification--parse-ref-at-point))
+              (thread-id (forgejo-notification--thread-id-at-point)))
+    (when (= (forgejo-db-get-notification-unread
+              forgejo-notification--host thread-id)
+             1)
+      (forgejo-notification--set-status thread-id "read"))
     (pcase-let ((`(,owner ,repo ,number) parsed))
       (let ((type (aref entry 0)))
         (if (string= type "PR")
