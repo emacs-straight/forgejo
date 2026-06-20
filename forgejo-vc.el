@@ -41,6 +41,10 @@
                   (host endpoint &optional params json-body callback))
 (declare-function forgejo-db-get-repo "forgejo-db.el"
                   (host owner name))
+(declare-function forgejo-db-get-pr-target "forgejo-db.el"
+                  (host owner repo branch))
+(declare-function forgejo-db-set-pr-target "forgejo-db.el"
+                  (host owner repo branch target))
 (declare-function forgejo-repo-sync-metadata "forgejo-repo.el"
                   (host-url owner repo))
 
@@ -161,12 +165,14 @@ Also syncs repo metadata if not yet cached."
           (match-string 3 remote-url)))))
 
 (defun forgejo-vc--all-forge-remotes ()
-  "Return all git remotes that parse as forge URLs.
-Each element is (HOST OWNER REPO REMOTE-NAME)."
+  "Return git remotes for hosts configured in `forgejo-hosts'.
+Remotes whose host is not configured (e.g. a GitLab or GitHub
+mirror) are ignored.  Each element is (HOST OWNER REPO REMOTE-NAME)."
   (cl-loop for remote in (forgejo-vc--remotes)
            for url = (forgejo-vc--remote-url remote)
            for parsed = (and url (forgejo-vc--parse-remote-url url))
-           when parsed collect (append parsed (list remote))))
+           when (and parsed (forgejo--host-configured-p (car parsed)))
+           collect (append parsed (list remote))))
 
 (defvar forgejo-vc--selected-remotes (make-hash-table :test 'equal)
   "Selected remote name per repo root directory.")
@@ -191,6 +197,10 @@ Returns (HOST OWNER REPO REMOTE-NAME) or nil."
              (cl-find selected all
                       :key (lambda (r) (nth 3 r)) :test #'string=))
         (car all))))
+
+(defun forgejo-vc--context-host (context)
+  "Return the bare hostname for CONTEXT's host URL."
+  (url-host (url-generic-parse-url (nth 0 context))))
 
 (defun forgejo-vc--upstream-branch (branch)
   "Return the upstream remote/branch for BRANCH, or nil."
@@ -369,6 +379,35 @@ Returns the template content as a string, or nil."
                     (process-exit-status proc)
                     (buffer-name (process-buffer proc)))))))))
 
+(defun forgejo-vc--default-target ()
+  "Return the repo's default branch as \"REMOTE/BRANCH\", or nil.
+Reads the default branch from the cached repo metadata."
+  (when-let* ((context (forgejo-vc--repo-from-remote))
+              (meta (forgejo-db-get-repo (forgejo-vc--context-host context)
+                                         (nth 1 context) (nth 2 context)))
+              (branch (alist-get 'default_branch meta)))
+    (format "%s/%s" (nth 3 context) branch)))
+
+(defun forgejo-vc--remembered-target (branch)
+  "Return the remembered PR target for BRANCH, or nil."
+  (when-let* ((context (forgejo-vc--repo-from-remote)))
+    (forgejo-db-get-pr-target (forgejo-vc--context-host context)
+                              (nth 1 context) (nth 2 context) branch)))
+
+(defun forgejo-vc--remember-target (branch target)
+  "Remember TARGET as the PR target for BRANCH."
+  (when-let* ((context (forgejo-vc--repo-from-remote)))
+    (forgejo-db-set-pr-target (forgejo-vc--context-host context)
+                              (nth 1 context) (nth 2 context) branch target)))
+
+(defun forgejo-vc--target-default (branch)
+  "Return the default target for BRANCH as \"REMOTE/BRANCH\", or nil.
+Prefers a remembered target, then the repo's default branch, then
+BRANCH's upstream."
+  (or (forgejo-vc--remembered-target branch)
+      (forgejo-vc--default-target)
+      (forgejo-vc--upstream-branch branch)))
+
 (defun forgejo-vc--read-target (&optional prompt)
   "Prompt for a target remote/branch.
 PROMPT is the label shown in the minibuffer (default \"Target\").
@@ -377,11 +416,9 @@ and TARGET is the branch name."
   (let* ((prompt (or prompt "Target"))
          (branch (car (vc-git-branches)))
          (all-remote-branches (forgejo-vc--remote-branches))
-         (default-target (forgejo-vc--upstream-branch branch))
+         (default-target (forgejo-vc--target-default branch))
          (choice (completing-read
-                  (if default-target
-                      (format "%s (default: %s): " prompt default-target)
-                    (format "%s (remote/branch): " prompt))
+                  (format-prompt prompt default-target)
                   all-remote-branches nil nil nil nil default-target)))
     (if (string-match "\\`\\([^/]+\\)/\\(.+\\)\\'" choice)
         (cons (match-string 1 choice) (match-string 2 choice))
@@ -442,7 +479,9 @@ With prefix arg FORCE-PUSH-P, force-push to update an existing PR."
         (forgejo-vc--git-push
          remote
          (forgejo-vc--refspec "HEAD" target topic)
-         (forgejo-vc--push-options title desc))))))
+         (forgejo-vc--push-options title desc))))
+    (forgejo-vc--remember-target (car (vc-git-branches))
+                                 (format "%s/%s" remote target))))
 
 ;;;###autoload
 (defun forgejo-vc-fetch (n)
@@ -544,7 +583,9 @@ and mark it as manually merged after a successful push."
                   (sha (forgejo-vc--head-sha)))
              (forgejo-vc--mark-merged host owner repo pr-number sha))))
         ((string-match-p "\\(?:exited\\|signal\\)" event)
-         (message "Push failed: %s" (string-trim event))))))))
+         (message "Push failed: %s" (string-trim event))))))
+    (forgejo-vc--remember-target (car (vc-git-branches))
+                                 (format "%s/%s" remote branch))))
 
 ;;; Repo-aware wrappers (use detected repo, no prompt)
 
@@ -552,7 +593,7 @@ and mark it as manually merged after a successful push."
   "Return (HOST OWNER REPO) from git remote, or signal error."
   (if-let* ((context (forgejo-vc--repo-from-remote)))
       (list (nth 0 context) (nth 1 context) (nth 2 context))
-    (user-error "Not in a git repo with a Forgejo remote")))
+    (user-error "No git remote matching `forgejo-hosts' found")))
 
 (defun forgejo-vc-issues ()
   "List issues for the current repository."
